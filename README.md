@@ -1,90 +1,61 @@
-# Bunkr Downloader Portable GUI
+# Bunkr Downloader — Kid Acid Edition
 
-This project is a fork of the original [BunkrDownloader by Lysagxra](https://github.com/Lysagxra/BunkrDownloader). Huge thanks to her for creating and maintaining the powerful core of this application!
+**Kid Acid Edition · V. 1.0.0**
 
-This version focuses on providing an user-friendly **Graphical User Interface (GUI)** for Windows users and includes other features to make downloading as simple as possible.
+Bunkr Downloader is an upgraded and modified edition of an existing Bunkr downloader. It focuses on reliable downloads, safe file handling, and clear progress tracking. This edition modifies existing software; it does not claim authorship of the original Bunkr downloader.
 
-### Screenshots
-*Download tab: paste a URL or load a batch file, watch live progress in the log.*
+Project: <https://github.com/debooseregregory-sys/BunkrDownloaderUpgrade-V.10>
 
-![Download tab](screenshots/screenshot-download-tab.png)
+## Features
 
-*Settings tab: save folder, concurrent downloads, retries, filters, and advanced toggles.*
+- Download a single Bunkr file or an album.
+- Queue multiple album and file URLs, or load a batch from a text file.
+- Show per-item queue status and download progress.
+- Skip completed local files marked **SKIPPED — ALREADY EXISTS**; existing files are not silently overwritten.
+- Write downloads to a temporary `.bunkr-part` file and publish the final file only after the download has been verified.
+- Retry recoverable network/server errors with controlled waits and fresh resolve/signing steps when required.
+- Choose the number of simultaneous downloads in Settings.
+- Optionally shut down Windows after the entire queue finishes successfully (or items are skipped because they already exist). The option is off by default, failed items require confirmation, and the 30-second countdown can be cancelled.
 
-![Settings tab](screenshots/screenshot-settings-tab.png)
+Scanning and resolving files does not delete, move, rename, or overwrite user files. Downloads that already exist locally are skipped.
 
-## ✨ Features
+## Download statuses
 
-This fork includes all the powerful core features from the original, plus:
+The queue reports each URL as it is processed, including **Waiting**, **Downloading**, **Completed**, **Skipped**, **Retrying**, **Failed**, and **Unverified** when the external-console mode cannot report per-file completion to the GUI.
 
-*   **Dual Download Modes:** Easily switch between downloading a single URL or batch downloading from a `.txt` file using a simple toggle.
-*   **Graphical User Interface (GUI):** A simple and intuitive interface for downloading. No command line needed!
-*   **Portable Windows Executable:** Download and run the application directly without needing to install Python or any dependencies.
-*   **Easy URL Pasting:** A convenient "Paste" button to quickly insert a Bunkr URL from your clipboard.
-*   **File Browser:** A "Browse" button to easily select your URL list file when in "Batch from file" mode.
-*   **Settings Tab:** Tweak the save folder, max concurrent downloads, retries, and include/exclude filters without touching the command line.
-*   **Stop Button:** Cancel a batch mid-run — the current URL finishes, the rest are skipped.
-*   **Detailed CLI Window (optional):** Toggle in Settings to spawn each download in its own console for the full Rich progress bars.
-*   **Automatic Folder Opening:** Once your download is complete, the folder containing the files will automatically open.
-*   **Build & Setup Scripts:** Comes with `.bat` scripts to easily set up the environment and build the executable from source.
+A download is only marked complete after its final file is verified and published. A triggered or attempted download is not treated as a completed local file.
 
-### Core Features
+## HTTP 503 and unstable downloads
 
-- Downloads multiple files from an album concurrently.
-- Supports batch downloading via a list of URLs.
-- Supports selective file downloading based on filename criteria.
-- Provides progress indication during downloads.
-- Automatically creates a directory structure for organized storage.
-- Logs URLs that encounter errors for troubleshooting.
+If downloads fail with HTTP 503 errors or are unstable, set **Max concurrent downloads** to **1** in Settings. A CDN may limit concurrent requests; reducing this setting can make downloads more reliable.
 
-## 💻 How to Use (Easy Way)
+## Run from source
 
-1.  Go to the [**Releases**](https://github.com/ZeroHackz/BunkrDownloader-Portable/releases) page.
-2.  Download the latest `BunkrDownloader-portable-GUI.exe` file.
-3.  Run the application.
-4.  **Choose your download mode:**
-    *   **For a single link:** Leave it on "Single URL", paste your Bunkr URL, and click **Download**.
-    *   **For multiple links:** Select "Batch from file", click **Browse** to select your `.txt` file, and then click **Download**.
-5.  That's it!
+Use Python 3.11 or 3.12 on Windows. From the project directory, create and activate a virtual environment, install the project requirements and the GUI package, then start `gui.py`:
 
-## 🛠️ For Developers (Building from Source)
+```bat
+py -3.12 -m venv venv
+call venv\Scripts\activate.bat
+python -m pip install -r requirements.txt customtkinter
+python gui.py
+```
 
-If you want to build the application yourself:
+To run the command-line downloader instead:
 
-1.  Clone this repository:
-    ```bash
-    git clone https://github.com/ZeroHackz/BunkrDownloader-Portable.git
-    ```
-2.  Navigate to the project directory:
-    ```bash
-    cd BunkrDownloader-Portable
-    ```
-3.  Run the setup script. This will create a virtual environment and install the required dependencies.
-    ```bat
-    setup_launcher.bat
-    ```
-4.  To build the executable, run the build script:
-    ```bat
-    build.bat
-    ```
-    The `.exe` will be available in the `dist` folder.
-
-## CLI Usage
-
-The original command-line interface is still available and fully functional.
-
-### Single Download
-
-```bash
+```bat
 python downloader.py <bunkr_url>
 ```
 
-### Selective & Batch Downloads
+## Portable Windows executable
 
-All the original flags like `--ignore`, `--include`, and batch downloading via `URLs.txt` are still supported. The recent upstream sync also adds `--custom-path`, `--max-retries`, `--disable-disk-check`, `--no-download-folder`, and `--version`.
- 
-For more details, please refer to the [Lysagxra README](https://github.com/Lysagxra/BunkrDownloader/blob/main/README.md).
+The portable executable can be built from source with the project build script:
 
-## Logging
+```bat
+build_modern.bat
+```
 
-The application logs any issues encountered during the download process in a file named `session.log`. Check this file for any URLs that may have been blocked or had errors.
+The script uses `BunkrDownloaderPortableGUI_Modern.spec` and writes the executable to `dist\BunkrDownloaderPortableGUI_Modern.exe`. The build bundles the application and its runtime; the target computer does not need the development virtual environment.
+
+## License and credits
+
+This modified edition retains the project license and notices in [LICENSE](LICENSE). The underlying downloader is based on existing open-source software; credit remains with its original contributors. Kid Acid branding refers to this modified edition only.

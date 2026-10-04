@@ -18,8 +18,10 @@ from rich.console import Console
 from src.bunkr_utils import get_bunkr_status
 from src.config import (
     KB,
+    MAX_WORKERS,
     AlbumInfo,
     DownloadInfo,
+    FailedReason,
     RetryConfig,
     SessionInfo,
     SkippedReason,
@@ -29,7 +31,9 @@ from src.crawlers.crawler_utils import (
     extract_all_album_item_pages,
     get_download_info,
     has_cached_item_pages,
+    resolve_download_link_sync,
 )
+from src.crawlers.api_utils import ResolveFailure
 from src.downloaders.album_downloader import AlbumDownloader, MediaDownloader
 from src.dry_run import execute_dry_run
 from src.file_utils import (
@@ -103,6 +107,7 @@ async def handle_download_process(
     initial_soup: BeautifulSoup,
     live_manager: LiveManager,
     max_retries: int,
+    max_workers: int = MAX_WORKERS,
 ) -> bool:
     """Handle the download process for a Bunkr album or a single item.
 
@@ -127,7 +132,10 @@ async def handle_download_process(
             live_manager=live_manager,
             cached_items=cached_items,
         )
-        return await album_downloader.download_album(max_retries=max_retries)
+        return await album_downloader.download_album(
+            max_workers=max_workers,
+            max_retries=max_retries,
+        )
 
     # Single item download
     download_link, filename = await get_download_info(url, initial_soup)
@@ -144,8 +152,9 @@ async def handle_download_process(
         ),
         live_manager=live_manager,
         retry_config = RetryConfig(),
+        refresh_download_link=lambda: resolve_download_link_sync(url),
     )
-    return media_downloader.download()
+    return await asyncio.to_thread(media_downloader.download)
 
 
 async def get_album_items(
@@ -258,7 +267,15 @@ async def validate_and_download(
             soup,
             live_manager,
             args.max_retries,
+            max_workers=args.max_workers,
         )
+
+    except ResolveFailure as err:
+        message = str(err)
+        write_on_session_log(message, reason=SkippedReason.SERVICE_UNAVAILABLE)
+        live_manager.update_log(event=err.code, details=message)
+        live_manager.update_summary(FailedReason.MAX_RETRIES_REACHED)
+        return True
 
     except (RequestConnectionError, Timeout, RequestException, RuntimeError) as err:
         error_message = f"Error downloading from {url}: {err}"

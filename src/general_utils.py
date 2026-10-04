@@ -29,6 +29,7 @@ from .config import (
     MIN_DISK_SPACE_GB,
     HTTPStatus,
 )
+from .diagnostics import log_http_503
 from .url_utils import replace_domain_with_fallback
 
 if TYPE_CHECKING:
@@ -39,6 +40,18 @@ def validate_download_link(download_link: str) -> bool:
     """Check if a download link is accessible."""
     try:
         response = requests.head(download_link, headers=DOWNLOAD_HEADERS, timeout=5)
+        if response.status_code == 503:
+            log_http_503(
+                route="HEAD",
+                url=getattr(response, "url", None) or download_link,
+                filename="link validation",
+                retry=1,
+                maximum=1,
+                retry_after=response.headers.get("Retry-After"),
+                wait=0,
+                fresh_signed_url=False,
+                reason="validation request does not retry",
+            )
 
     except requests.RequestException:
         return False
@@ -58,30 +71,82 @@ async def fetch_page(url: str, retries: int = 5) -> BeautifulSoup | None:
             return None
 
         # Use raw bytes to let BS4 detect encoding
-        return BeautifulSoup(response.content, "html.parser")
-
-    for attempt in range(retries):
-        try:
-            response = requests.Session().get(url, timeout=40)
-            if response.status_code == HTTPStatus.FORBIDDEN and not tried_fallback:
-                tried_fallback = True
-                url = replace_domain_with_fallback(url)
-                continue  # Retry immediately with .cr
-
-            response.raise_for_status()
-            return handle_response(response)
-
-        # Connection dropped unexpectedly by the server
-        except RemoteDisconnected:
-            logging.exception("Remote end closed connection without response.")
-            if attempt < retries - 1:
-                # Add jitter to avoid a retry storm
-                delay = 2 ** (attempt + 1) + random.uniform(1, 2)  # noqa: S311
-                await asyncio.sleep(delay)
-
-        # Catch-all for request-related errors
-        except requests.RequestException:
+        soup = BeautifulSoup(response.content, "html.parser")
+        title = soup.title.get_text(" ", strip=True).lower() if soup.title else ""
+        body_text = soup.get_text(" ", strip=True).lower()[:2000]
+        maintenance_phrases = (
+            "under maintenance",
+            "site maintenance",
+            "temporarily unavailable",
+            "we'll be back soon",
+        )
+        if any(phrase in title or phrase in body_text for phrase in maintenance_phrases):
+            logging.warning("Bunkr returned a maintenance page for %s", url)
             return None
+        return soup
+
+    with requests.Session() as session:
+        for attempt in range(retries):
+            response = None
+            status = None
+            try:
+                response = session.get(
+                    url, headers=DOWNLOAD_HEADERS, timeout=40, allow_redirects=True,
+                )
+                if response.status_code == HTTPStatus.FORBIDDEN and not tried_fallback:
+                    tried_fallback = True
+                    url = replace_domain_with_fallback(url)
+                    continue  # Retry immediately with .cr
+
+                response.raise_for_status()
+                return handle_response(response)
+
+            except RemoteDisconnected:
+                logging.warning("Remote end closed connection without response.")
+            except requests.RequestException as err:
+                response = getattr(err, "response", None) or response
+                status = response.status_code if response is not None else None
+                if status not in (429, 500, 502, 503, 504) and response is not None:
+                    logging.warning("Page request failed with HTTP %s for %s", status, url)
+                    return None
+                if status is None and not isinstance(
+                    err, (requests.Timeout, requests.ConnectionError),
+                ):
+                    logging.warning("Page request failed: %s", err)
+                    return None
+            finally:
+                if response is not None:
+                    response.close()
+
+            if attempt < retries - 1:
+                delay = min(2 ** (attempt + 1), 30) + random.uniform(0.25, 1.0)  # noqa: S311
+                if status == 503:
+                    log_http_503(
+                        route="PAGE_GET",
+                        url=getattr(response, "url", None) or url,
+                        filename="page resolve",
+                        retry=attempt + 1,
+                        maximum=retries,
+                        retry_after=response.headers.get("Retry-After"),
+                        wait=delay,
+                        fresh_signed_url=False,
+                        phase="PAGE",
+                    )
+                await asyncio.sleep(delay)
+            elif status == 503:
+                log_http_503(
+                    route="PAGE_GET",
+                    url=getattr(response, "url", None) or url,
+                    filename="page resolve",
+                    retry=retries,
+                    maximum=retries,
+                    retry_after=response.headers.get("Retry-After"),
+                    wait=0,
+                    fresh_signed_url=False,
+                    final=True,
+                    phase="PAGE",
+                    reason="page retry budget exhausted",
+                )
 
     return None
 

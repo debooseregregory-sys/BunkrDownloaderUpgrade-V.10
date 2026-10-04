@@ -7,14 +7,25 @@ download experience.
 from __future__ import annotations
 
 import random
+import os
+import threading
 import time
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
+from collections.abc import Callable
 
 import requests
 from requests import RequestException
 
-from src.bunkr_utils import mark_subdomain_as_offline, subdomain_is_offline
+from src.diagnostics import (
+    log_cdn_503_stage,
+    log_download_start,
+    log_http_503,
+    track_download,
+)
 from src.config import (
     DOWNLOAD_HEADERS,
     CompletedReason,
@@ -44,6 +55,35 @@ if TYPE_CHECKING:
     from src.managers.live_manager import LiveManager
 
 
+CDN_503_BASE_DELAY = 15.0
+CDN_503_MAX_DELAY = 180.0
+CDN_503_JITTER = (2.0, 5.0)
+
+
+_PATH_LOCKS: dict[str, tuple[threading.Lock, int]] = {}
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def _lock_download_path(path: Path):
+    """Serialize writers for one destination path within this process."""
+    key = os.path.normcase(os.path.abspath(str(path)))
+    with _PATH_LOCKS_GUARD:
+        lock, users = _PATH_LOCKS.get(key, (threading.Lock(), 0))
+        _PATH_LOCKS[key] = (lock, users + 1)
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+        with _PATH_LOCKS_GUARD:
+            current_lock, users = _PATH_LOCKS[key]
+            if users <= 1:
+                del _PATH_LOCKS[key]
+            else:
+                _PATH_LOCKS[key] = (current_lock, users - 1)
+
+
 class MediaDownloader:
     """Manage the downloading of individual files from Bunkr URLs."""
 
@@ -53,14 +93,28 @@ class MediaDownloader:
         download_info: DownloadInfo,
         live_manager: LiveManager,
         retry_config: RetryConfig,
+        refresh_download_link: Callable[[], str] | None = None,
     ) -> None:
         """Initialize the MediaDownloader instance."""
         self.session_info = session_info
         self.download_info = download_info
         self.live_manager = live_manager
         self.retry_config = retry_config
+        self.refresh_download_link = refresh_download_link
+        self._suppress_external_retry = False
 
-    def attempt_download(self, final_path: str) -> bool:
+    def attempt_download(self, final_path: str) -> bool | None:
+        """Track one active media transfer and emit a token-safe start record."""
+        connections = getattr(self.session_info.args, "connections", 1)
+        with track_download():
+            log_download_start(
+                self.download_info.filename,
+                self.download_info.download_link,
+                chunks=connections,
+            )
+            return self._attempt_download(final_path)
+
+    def _attempt_download(self, final_path: str) -> bool | None:
         """Attempt to download the file, using parallel chunks when possible.
 
         If the server supports byte-range requests and the file is large enough, the
@@ -79,14 +133,20 @@ class MediaDownloader:
         rate_limiter = self.session_info.rate_limiter
 
         for attempt in range(self.retry_config.retries):
+            request_route = "MEDIA_GET"
             try:
                 supports_range, content_length = detect_range_support(
-                    self.download_info.download_link, DOWNLOAD_HEADERS,
+                    self.download_info.download_link,
+                    DOWNLOAD_HEADERS,
+                    filename=self.download_info.filename,
+                    retry=attempt + 1,
+                    maximum=self.retry_config.retries,
                 )
 
                 if should_use_parallel_download(
                     content_length, num_connections, supports_range=supports_range,
                 ):
+                    request_route = "CHUNK_GET"
                     # .partN files are preserved on failure so a re-attempt
                     # (here or on a future run) resumes instead of restarting.
                     chunked_failed = save_file_with_chunks(
@@ -120,22 +180,144 @@ class MediaDownloader:
                     stream=True,
                     headers=DOWNLOAD_HEADERS,
                     timeout=30,
+                    allow_redirects=True,
                 )
                 response.raise_for_status()
 
             except RequestException as req_err:
+                response = getattr(req_err, "response", None)
+                if response is not None:
+                    response.close()
+                status = response.status_code if response is not None else None
+                if status in (401, 403) and self._refresh_after_auth_failure(attempt):
+                    continue
+                if status == 503:
+                    if not self._handle_request_exception(
+                        req_err, attempt, route=request_route,
+                    ):
+                        self._suppress_external_retry = True
+                        self.download_info.download_link = ""
+                        break
+                    if not self._refresh_after_cdn_503(attempt, request_route):
+                        self._suppress_external_retry = True
+                        break
+                    continue
                 if not self._handle_request_exception(req_err, attempt):
                     break
 
             else:
-                return save_file_with_progress(
+                outcome = save_file_with_progress(
                     response,
                     final_path,
                     self.download_info.task,
                     self.live_manager,
                     rate_limiter=rate_limiter,
                 )
+                if outcome is None:
+                    return None
+                if not outcome:
+                    return False
+                if not self._retry_with_backoff(attempt, event="Retrying incomplete download"):
+                    break
 
+        return True
+
+    def _refresh_after_auth_failure(self, attempt: int) -> bool:
+        """Resolve a new signed URL after a plausible token/auth rejection."""
+        rejected_link = self.download_info.download_link
+        # A rejected signature must never leak into the album-level retry pass.
+        self.download_info.download_link = ""
+        if self.refresh_download_link is None or (
+            attempt >= self.retry_config.retries - 1
+            and not self.retry_config.has_external_retry
+        ):
+            return False
+        try:
+            fresh_link = self.refresh_download_link()
+        except Exception as exc:  # resolver failures are logged and the old link is discarded
+            self.live_manager.update_log(
+                event="Resolve failed after authorization error",
+                details=f"{self.download_info.filename}: {exc}",
+            )
+            return False
+        if not fresh_link or fresh_link == rejected_link:
+            self.live_manager.update_log(
+                event="Token refresh failed",
+                details=f"No new signed URL was returned for {self.download_info.filename}.",
+            )
+            return False
+        self.download_info.download_link = fresh_link
+        return self._retry_with_backoff(attempt, event="Retrying after fresh resolve")
+
+    def _refresh_after_cdn_503(self, attempt: int, route: str) -> bool:
+        """Resolve the item page, API metadata and signature before retrying a 503."""
+        rejected_link = self.download_info.download_link
+        self.download_info.download_link = ""
+        log_cdn_503_stage(
+            "503 CDN -> fresh resolve",
+            filename=self.download_info.filename,
+            url=rejected_link,
+            retry=attempt + 2,
+            maximum=self.retry_config.retries,
+            route=route,
+        )
+
+        def log_resolve_abandoned(reason: str) -> None:
+            log_http_503(
+                route=route,
+                url=rejected_link,
+                cdn_url=rejected_link,
+                filename=self.download_info.filename,
+                retry=attempt + 1,
+                maximum=self.retry_config.retries,
+                retry_after=None,
+                wait=0,
+                fresh_signed_url=False,
+                final=True,
+                reason=reason,
+            )
+
+        if self.refresh_download_link is None:
+            self.live_manager.update_log(
+                event="503 CDN resolve failed",
+                details=f"No resolver is available for {self.download_info.filename}.",
+            )
+            log_resolve_abandoned("fresh resolver unavailable")
+            return False
+        try:
+            fresh_link = self.refresh_download_link()
+        except Exception as exc:
+            self.live_manager.update_log(
+                event="503 CDN resolve failed",
+                details=f"Fresh resolve failed for {self.download_info.filename}: {exc}",
+            )
+            log_resolve_abandoned("fresh resolve failed")
+            return False
+        if not fresh_link or fresh_link == rejected_link:
+            self.live_manager.update_log(
+                event="503 CDN resolve failed",
+                details=f"No different signed URL was returned for {self.download_info.filename}.",
+            )
+            log_resolve_abandoned("no different signed URL returned")
+            return False
+
+        self.download_info.download_link = fresh_link
+        log_cdn_503_stage(
+            "fresh signed URL obtained",
+            filename=self.download_info.filename,
+            url=fresh_link,
+            retry=attempt + 2,
+            maximum=self.retry_config.retries,
+            route=route,
+        )
+        log_cdn_503_stage(
+            f"retrying {route}",
+            filename=self.download_info.filename,
+            url=fresh_link,
+            retry=attempt + 2,
+            maximum=self.retry_config.retries,
+            route=route,
+        )
         return True
 
     def download(self) -> bool:
@@ -148,20 +330,6 @@ class MediaDownloader:
 
         """
         is_final_attempt = not self.retry_config.has_external_retry
-        is_offline = subdomain_is_offline(
-            self.download_info.download_link,
-            self.session_info.bunkr_status,
-        )
-
-        if is_offline and is_final_attempt:
-            self.live_manager.update_log(
-                event="Non-operational subdomain",
-                details=f"The subdomain for {self.download_info.filename} is offline. "
-                "Check the log file.",
-            )
-            self._finalize_download(SkippedReason.DOMAIN_OFFLINE)
-            return False
-
         formatted_filename = truncate_filename(self.download_info.filename)
         final_path = Path(self.session_info.download_path) / formatted_filename
 
@@ -171,7 +339,12 @@ class MediaDownloader:
 
         # Attempt to download the file with retries
         try:
-            failed_download = self.attempt_download(final_path)
+            with _lock_download_path(final_path):
+                # Another album item may have finished the same target while this
+                # task was resolving its signed URL.
+                if self._skip_file_download(final_path):
+                    return False
+                failed_download = self.attempt_download(final_path)
 
         except requests.exceptions.ConnectionError:
             self.live_manager.update_log(
@@ -180,9 +353,17 @@ class MediaDownloader:
             )
             failed_download = True
 
+        if failed_download is None:
+            # A concurrent process may have completed this target after our initial
+            # check. Re-run the normal, user-visible skip accounting.
+            self._skip_file_download(final_path)
+            return False
+
         # Handle failed download after retries
         if failed_download:
-            return self._handle_failed_download(is_final_attempt=is_final_attempt)
+            return self._handle_failed_download(
+                is_final_attempt=is_final_attempt or self._suppress_external_retry,
+            )
 
         self.live_manager.update_summary(CompletedReason.DOWNLOAD_SUCCESS)
         return False
@@ -213,11 +394,35 @@ class MediaDownloader:
             return True
 
         # Check if the file already exists
-        if Path(final_path).exists():
-            self.live_manager.update_summary(SkippedReason.ALREADY_DOWNLOADED)
-            return log_and_skip_event(
-                f"{self.download_info.filename} has already been downloaded.",
+        existing_path = Path(final_path)
+        if existing_path.exists() and existing_path.is_file():
+            try:
+                existing_size = existing_path.stat().st_size
+            except OSError:
+                existing_size = -1
+            if existing_size > 0:
+                self.live_manager.update_summary(SkippedReason.ALREADY_DOWNLOADED)
+                return log_and_skip_event(
+                    f"{self.download_info.filename} has already been downloaded."
+                )
+            self.live_manager.update_log(
+                event="Incomplete existing file",
+                details=(
+                    f"{self.download_info.filename} is zero bytes and was preserved. "
+                    "Remove it manually before retrying; existing paths are never overwritten."
+                ),
             )
+            self.live_manager.update_summary(SkippedReason.SERVICE_UNAVAILABLE)
+            return log_and_skip_event(
+                f"Preserved incomplete destination {existing_path}; it was not overwritten."
+            )
+        elif existing_path.exists():
+            self.live_manager.update_log(
+                event="Destination conflict",
+                details=f"The target path is not a file: {existing_path}",
+            )
+            self.live_manager.update_summary(SkippedReason.SERVICE_UNAVAILABLE)
+            return log_and_skip_event(f"Cannot download to non-file path {existing_path}.")
 
         # Check if the file is in the ignore list
         if matches_ignore_list(self.download_info.filename, ignore_list):
@@ -233,20 +438,14 @@ class MediaDownloader:
                 f"No included words found for {self.download_info.filename}.",
             )
 
-        # Check if the subdomain is marked as offline
-        if subdomain_is_offline(
-            self.download_info.download_link, self.session_info.bunkr_status,
-        ):
-            self._finalize_download(SkippedReason.DOMAIN_OFFLINE)
-            return log_and_skip_event(
-                f"The subdomain for {self.download_info.download_link} has been "
-                "previously marked as offline.",
-            )
-
         # If none of the skip conditions are met, do not skip
         return False
 
-    def _retry_with_backoff(self, attempt: int, *, event: str) -> bool:
+    def _retry_with_backoff(
+        self, attempt: int, *, event: str, retry_after: float | None = None,
+        status_code: int | None = None, request_url: str | None = None,
+        retry_after_value: str | None = None, route: str = "MEDIA_GET",
+    ) -> bool:
         """Log error, apply backoff, and return True if should retry."""
         self.live_manager.update_log(
             event=event,
@@ -255,46 +454,107 @@ class MediaDownloader:
         )
 
         if attempt < self.retry_config.retries - 1:
-            delay = 3 ** (attempt + 1) + random.uniform(1, 3)  # noqa: S311
+            if status_code == 503:
+                delay = (
+                    min(max(retry_after, CDN_503_BASE_DELAY), CDN_503_MAX_DELAY)
+                    if retry_after is not None
+                    else min(CDN_503_BASE_DELAY * (2 ** attempt), 150.0)
+                    + random.uniform(*CDN_503_JITTER)  # noqa: S311
+                )
+                delay = min(delay, CDN_503_MAX_DELAY)
+            else:
+                delay = (
+                    min(max(retry_after, 0.0), 120.0)
+                    if retry_after is not None
+                    else min(2 ** attempt, 30) + random.uniform(0.25, 1.0)  # noqa: S311
+                )
+            if status_code == 503:
+                log_http_503(
+                    route=route,
+                    url=request_url or self.download_info.download_link,
+                    cdn_url=self.download_info.download_link,
+                    filename=self.download_info.filename,
+                    retry=attempt + 1,
+                    maximum=self.retry_config.retries,
+                    retry_after=retry_after_value,
+                    wait=delay,
+                    fresh_signed_url=False,
+                )
+                log_cdn_503_stage(
+                    "503 CDN -> waiting",
+                    filename=self.download_info.filename,
+                    url=self.download_info.download_link,
+                    retry=attempt + 1,
+                    maximum=self.retry_config.retries,
+                    route=route,
+                )
             time.sleep(delay)
             return True
 
+        if status_code == 503:
+            log_http_503(
+                route=route,
+                url=request_url or self.download_info.download_link,
+                cdn_url=self.download_info.download_link,
+                filename=self.download_info.filename,
+                retry=self.retry_config.retries,
+                maximum=self.retry_config.retries,
+                retry_after=retry_after_value,
+                wait=0,
+                fresh_signed_url=False,
+                final=True,
+                reason="retry budget exhausted",
+            )
         return False
 
     def _handle_request_exception(
-        self, req_err: RequestException, attempt: int,
+        self, req_err: RequestException, attempt: int, *, route: str = "MEDIA_GET",
     ) -> bool:
         """Handle exceptions during the request and manages retries."""
-        is_server_down = (
-            req_err.response is None
-            or req_err.response.status_code in (
-                HTTPStatus.SERVER_DOWN,
-                HTTPStatus.SERVICE_UNAVAILABLE,
-            )
-        )
-
-        # Mark the subdomain as offline and exit the loop
-        if is_server_down:
-            marked_subdomain = mark_subdomain_as_offline(
-                self.session_info.bunkr_status,
-                self.download_info.download_link,
-            )
+        response = req_err.response
+        status = response.status_code if response is not None else None
+        if status == HTTPStatus.TOO_MANY_REQUESTS or (status is not None and 500 <= status <= 599) or response is None:
+            retry_after = None
+            retry_after_value = None
+            if response is not None:
+                retry_after_value = response.headers.get("Retry-After")
+                try:
+                    retry_after = float(retry_after_value or "")
+                except (TypeError, ValueError):
+                    try:
+                        retry_at = parsedate_to_datetime(retry_after_value or "")
+                        retry_after = max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+                    except (TypeError, ValueError, OverflowError):
+                        retry_after = None
             self.live_manager.update_log(
-                event="No response",
-                details=f"Subdomain '{marked_subdomain}' has been marked as offline.",
+                event="503 CDN -> waiting" if status == 503 else "Retrying temporary server/network error",
+                details=f"HTTP {status or 'connection error'} for {self.download_info.filename}.",
+            )
+            return self._retry_with_backoff(
+                attempt,
+                event="Retrying download",
+                retry_after=retry_after,
+                status_code=status,
+                request_url=getattr(response, "url", None) if response is not None else None,
+                retry_after_value=retry_after_value,
+                route=route,
+            )
+
+        if status == 404:
+            self.live_manager.update_log(
+                event="HTTP 404 - not found",
+                details=f"The server reports that {self.download_info.filename} was not found.",
             )
             return False
 
-        if req_err.response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
-            return self._retry_with_backoff(attempt, event="Retrying download")
-
-        if req_err.response.status_code == HTTPStatus.BAD_GATEWAY:
+        if status in (401, HTTPStatus.FORBIDDEN):
             self.live_manager.update_log(
-                event="Server error",
-                details=f"Bad gateway for {self.download_info.filename}.",
+                event="DOWNLOAD_FAILED — authorization",
+                details=(
+                    f"HTTP {status} after resolve for {self.download_info.filename}; "
+                    "the fresh resolve was unavailable or exhausted."
+                ),
             )
-            # Setting retries to 1 forces an immediate failure on the next check.
-            self.retry_config.retries = 1
             return False
 
         # Do not retry, exit the loop

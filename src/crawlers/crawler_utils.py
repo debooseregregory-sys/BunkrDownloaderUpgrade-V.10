@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from pathlib import Path
@@ -9,11 +10,12 @@ from pathlib import Path
 import aiohttp
 from bs4 import BeautifulSoup
 
+from src.diagnostics import log_http_503
 from src.file_utils import remove_invalid_characters
 from src.general_utils import fetch_page
 from src.url_utils import get_url_based_filename
 
-from .api_utils import get_api_response
+from .api_utils import ResolveFailure, get_api_response
 
 
 def has_cached_item_pages(cached_state: dict | None, identifier: str) -> bool:
@@ -98,6 +100,20 @@ async def get_item_download_link(
     """Retrieve a signed direct download URL for a Bunkr item page."""
     if soup is None:
         async with session.get(item_url) as response:
+            if response.status == 503:
+                log_http_503(
+                    route="PAGE_GET",
+                    url=getattr(response, "url", None) or item_url,
+                    filename="item page",
+                    retry=1,
+                    maximum=1,
+                    retry_after=response.headers.get("Retry-After"),
+                    wait=0,
+                    fresh_signed_url=False,
+                    final=True,
+                    phase="ITEM_PAGE",
+                    reason="item-page request has no retry at this layer",
+                )
             html = await response.text()
 
         soup = BeautifulSoup(html, "html.parser")
@@ -177,3 +193,19 @@ async def get_download_info(item_url: str, item_soup: BeautifulSoup) -> tuple:
         else item_filename
     )
     return item_download_link, formatted_item_filename
+
+
+def resolve_download_link_sync(item_url: str) -> str:
+    """Run a fresh page/API/sign resolution from a downloader worker thread."""
+    async def resolve() -> str:
+        item_soup = await fetch_page(item_url)
+        if item_soup is None:
+            raise ResolveFailure(
+                "TEMPORARY_RESOLVE_ERROR", "PAGE", "file page could not be fetched",
+            )
+        link, _ = await get_download_info(item_url, item_soup)
+        if not link:
+            raise ResolveFailure("RESOLVE_FAILED", "RESOLVE", "no signed URL returned")
+        return link
+
+    return asyncio.run(resolve())

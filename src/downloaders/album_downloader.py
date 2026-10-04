@@ -20,7 +20,13 @@ from src.config import (
     SessionInfo,
     SkippedReason,
 )
-from src.crawlers.crawler_utils import get_download_info
+from src.crawlers.api_utils import ResolveFailure
+from src.crawlers.crawler_utils import (
+    get_download_info,
+    get_item_filename,
+    resolve_download_link_sync,
+)
+from src.diagnostics import track_download_async
 from src.file_utils import truncate_filename
 from src.general_utils import fetch_page
 from src.managers.state_manager import save_album_state
@@ -61,7 +67,7 @@ class AlbumDownloader:
         max_retries: int,
     ) -> None:
         """Handle the download of an individual item in the album."""
-        async with semaphore:
+        async with semaphore, track_download_async():
             # Fast path: this item was confirmed downloaded on a previous run and the
             # file is still on disk -- skip entirely without fetching the item page or
             # calling the signing API.
@@ -72,7 +78,13 @@ class AlbumDownloader:
                     Path(self.session_info.download_path)
                     / truncate_filename(cached_filename)
                 )
-                if expected_path.exists():
+                try:
+                    completed_file_exists = (
+                        expected_path.is_file() and expected_path.stat().st_size > 0
+                    )
+                except OSError:
+                    completed_file_exists = False
+                if completed_file_exists:
                     task = self.live_manager.add_task(current_task=current_task)
                     self.live_manager.update_log(
                         event="Skipped download",
@@ -89,10 +101,42 @@ class AlbumDownloader:
 
             # Process the download of an item
             item_soup = await self._fetch_page_with_retries(item_page)
-            item_download_link, item_filename = await get_download_info(
-                item_page,
-                item_soup,
+            page_filename = get_item_filename(item_soup)
+            existing_path = (
+                Path(self.session_info.download_path) / truncate_filename(page_filename)
             )
+            try:
+                already_present = (
+                    existing_path.is_file() and existing_path.stat().st_size > 0
+                )
+            except OSError:
+                already_present = False
+            if already_present:
+                self.live_manager.update_log(
+                    event="Skipped download",
+                    details=f"{page_filename} has already been downloaded.",
+                )
+                self.live_manager.update_task(task, completed=100, visible=False)
+                self.live_manager.update_summary(SkippedReason.ALREADY_DOWNLOADED)
+                await self._persist_item_state(item_page, page_filename, failed=False)
+                return
+
+            try:
+                item_download_link, item_filename = await get_download_info(
+                    item_page,
+                    item_soup,
+                )
+            except ResolveFailure as exc:
+                try:
+                    item_filename = get_item_filename(item_soup)
+                except (AttributeError, TypeError):
+                    item_filename = item_page
+                self.live_manager.update_log(event="Resolve failed", details=str(exc))
+                self.live_manager.update_task(task, completed=100, visible=False)
+                self.live_manager.update_summary(FailedReason.MAX_RETRIES_REACHED)
+                self.unresolved_failures += 1
+                await self._persist_item_state(item_page, item_filename, failed=True)
+                return
 
             # Download item
             if item_download_link:
@@ -109,6 +153,7 @@ class AlbumDownloader:
                         retries=max_retries,
                         has_external_retry=True,
                     ),
+                    refresh_download_link=lambda: resolve_download_link_sync(item_page),
                 )
 
                 failed_download = await asyncio.to_thread(media_downloader.download)
@@ -116,7 +161,7 @@ class AlbumDownloader:
                     self.failed_downloads.append({
                         "id": task,
                         "filename": item_filename,
-                        "download_link": item_download_link,
+                        "download_link": media_downloader.download_info.download_link,
                         "item_url": item_page,
                     })
 
@@ -187,7 +232,12 @@ class AlbumDownloader:
             expected_path = (
                 Path(self.session_info.download_path) / truncate_filename(filename)
             )
-            is_completed = expected_path.exists()
+            try:
+                is_completed = (
+                    expected_path.is_file() and expected_path.stat().st_size > 0
+                )
+            except OSError:
+                is_completed = False
 
         async with self._state_lock:
             self.cached_items[item_page] = {
@@ -237,7 +287,10 @@ class AlbumDownloader:
             live_manager=self.live_manager,
             # Retry once for failed downloads. No external retries are available after
             # this attempt.
-            retry_config=RetryConfig(retries=1, has_external_retry=False),
+            retry_config=RetryConfig(retries=2, has_external_retry=False),
+            refresh_download_link=lambda: resolve_download_link_sync(
+                failed_download_info.item_url,
+            ),
         )
         # Run the synchronous download function in a separate thread
         return await asyncio.to_thread(media_downloader.download)
@@ -252,6 +305,12 @@ class AlbumDownloader:
         still_failed = []
 
         for data in self.failed_downloads:
+            if not data.get("download_link"):
+                still_failed.append(data)
+                await self._persist_item_state(
+                    data["item_url"], data["filename"], failed=True,
+                )
+                continue
             failed_download_info = DownloadInfo(
                 item_url=data["item_url"],
                 download_link=data["download_link"],

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import shutil
 import threading
@@ -16,6 +17,7 @@ import requests
 from requests import Response
 from requests.exceptions import ChunkedEncodingError, RequestException
 
+from src.diagnostics import log_http_503, track_chunk_request
 from src.config import (
     CHUNK_BASE_DELAY,
     CHUNK_MAX_RETRIES,
@@ -50,7 +52,7 @@ def save_file_with_progress(
     task: int,
     live_manager: LiveManager,
     rate_limiter: RateLimiter | None = None,
-) -> bool:
+) -> bool | None:
     """Save the file from the response to the specified path.
 
     Adds a `.temp` extension while downloading. Handles network interruptions
@@ -59,11 +61,20 @@ def save_file_with_progress(
 
     Returns True on failure (partial file kept), False on success.
     """
-    file_size = int(response.headers.get("Content-Length", -1))
+    existing = Path(download_path)
+    if existing.exists():
+        response.close()
+        return None
+
+    try:
+        file_size = int(response.headers.get("Content-Length", -1))
+    except (TypeError, ValueError):
+        response.close()
+        return True
     if file_size == -1:
         logging.warning("Content length not provided in response headers.")
 
-    temp_download_path = Path(download_path).with_suffix(".temp")
+    temp_download_path = Path(f"{download_path}.bunkr-part")
     chunk_size = get_chunk_size(file_size)
     total_downloaded = 0
 
@@ -75,17 +86,34 @@ def save_file_with_progress(
                     if rate_limiter:
                         rate_limiter.consume(len(chunk))
                     total_downloaded += len(chunk)
-                    completed = (total_downloaded / file_size) * 100
-                    live_manager.update_task(task, completed=completed)
+                    if file_size > 0:
+                        completed = min((total_downloaded / file_size) * 100, 100)
+                        live_manager.update_task(task, completed=completed)
 
-    except ChunkedEncodingError:
+    except (ChunkedEncodingError, OSError, RequestException):
+        response.close()
         return True
+    finally:
+        response.close()
 
-    if total_downloaded == file_size:
-        shutil.move(temp_download_path, download_path)
-        return False
-
-    return True
+    # A complete streamed response without Content-Length is valid; if the server
+    # supplied a length, require an exact match before publishing the final filename.
+    verified = total_downloaded > 0 and (file_size < 0 or total_downloaded == file_size)
+    if not verified:
+        return True
+    try:
+        # Creating a hard link publishes atomically and, unlike replace(), cannot
+        # overwrite a destination that appeared while the transfer was running.
+        os.link(temp_download_path, existing)
+    except FileExistsError:
+        return None
+    except OSError:
+        return True
+    try:
+        temp_download_path.unlink(missing_ok=True)
+    except OSError:
+        logging.warning("Could not remove temporary download file: %s", temp_download_path)
+    return False
 
 
 # ==========================
@@ -94,6 +122,10 @@ def save_file_with_progress(
 def detect_range_support(
     url: str,
     headers: dict[str, str],
+    *,
+    filename: str = "unknown",
+    retry: int = 1,
+    maximum: int = 1,
 ) -> tuple[bool, int]:
     """Send a HEAD request to detect Range support and retrieve the file size."""
     try:
@@ -102,7 +134,27 @@ def detect_range_support(
         supports_range = response.headers.get("Accept-Ranges", "").lower() == "bytes"
         content_length = int(response.headers.get("Content-Length", -1))
 
-    except (RequestException, ValueError):
+    except RequestException as exc:
+        response = getattr(exc, "response", None)
+        if response is not None and response.status_code == 503:
+            raw_retry_after = response.headers.get("Retry-After")
+            log_http_503(
+                route="HEAD",
+                url=getattr(response, "url", None) or url,
+                cdn_url=url,
+                filename=filename,
+                retry=retry,
+                maximum=maximum,
+                retry_after=raw_retry_after,
+                wait=0,
+                fresh_signed_url=False,
+                reason="HEAD failed; continuing with GET fallback",
+            )
+        # Some CDN nodes reject HEAD while allowing GET (including Range GET).
+        # A HEAD authorization response is therefore not proof that the signed URL
+        # is invalid; the real GET below will determine whether it needs refreshing.
+        return False, -1
+    except ValueError:
         return False, -1
 
     return supports_range, content_length
@@ -211,6 +263,9 @@ def _attempt_chunk_once(
     byte_range: tuple[int, int],
     path: Path,
     chunk_info: ChunkInfo,
+    *,
+    attempt: int = 1,
+    diagnostic: dict | None = None,
 ) -> bool:
     """Make a single attempt to download one byte-range chunk to disk.
 
@@ -230,29 +285,42 @@ def _attempt_chunk_once(
     written = 0
 
     try:
-        with requests.get(
-            url,
-            headers=chunk_headers,
-            stream=True,
-            timeout=30,
-        ) as response:
-            response.raise_for_status()
-            with path.open("wb") as file:
-                for data in response.iter_content(chunk_size=LARGE_FILE_CHUNK_SIZE):
-                    if data:
-                        file.write(data)
-                        num_bytes = len(data)
+        with track_chunk_request():
+            with requests.get(
+                url,
+                headers=chunk_headers,
+                stream=True,
+                timeout=30,
+            ) as response:
+                response.raise_for_status()
+                with path.open("wb") as file:
+                    for data in response.iter_content(chunk_size=LARGE_FILE_CHUNK_SIZE):
+                        if data:
+                            file.write(data)
+                            num_bytes = len(data)
 
-                        if chunk_info.rate_limiter:
-                            chunk_info.rate_limiter.consume(num_bytes)
+                            if chunk_info.rate_limiter:
+                                chunk_info.rate_limiter.consume(num_bytes)
 
-                        written += num_bytes
-                        chunk_info.on_progress(num_bytes)
+                            written += num_bytes
+                            chunk_info.on_progress(num_bytes)
 
         if path.exists() and path.stat().st_size == expected:
             return False
 
-    except (RequestException, OSError):
+    except RequestException as exc:
+        chunk_info.on_progress(-written)
+        if diagnostic is not None:
+            response = exc.response
+            diagnostic.update(
+                status=response.status_code if response is not None else None,
+                url=getattr(response, "url", None) if response is not None else None,
+                retry_after=(response.headers.get("Retry-After") if response is not None else None),
+            )
+        if exc.response is not None and exc.response.status_code in (401, 403, 503):
+            raise
+        return True
+    except OSError:
         chunk_info.on_progress(-written)
         return True
 
@@ -286,6 +354,7 @@ def _download_single_chunk(
         return False
 
     for attempt in range(1, CHUNK_MAX_RETRIES + 1):
+        diagnostic = {}
         failed = _attempt_chunk_once(
             url,
             (start_byte, end_byte),
@@ -294,12 +363,30 @@ def _download_single_chunk(
             # on_progress,
             # rate_limiter,
             chunk_info,
+            attempt=attempt,
+            diagnostic=diagnostic,
         )
         if not failed:
             return False
 
+        delay = 0.0
         if attempt < CHUNK_MAX_RETRIES:
             delay = CHUNK_BASE_DELAY * (2 ** (attempt - 1)) + random.uniform(0, 1)  # noqa: S311
+        if diagnostic.get("status") == 503:
+            log_http_503(
+                route="CHUNK_GET",
+                url=diagnostic.get("url") or url,
+                cdn_url=url,
+                filename=path.name,
+                retry=attempt,
+                maximum=CHUNK_MAX_RETRIES,
+                retry_after=diagnostic.get("retry_after"),
+                wait=delay,
+                fresh_signed_url=False,
+                final=attempt == CHUNK_MAX_RETRIES,
+                reason="chunk retry budget exhausted" if attempt == CHUNK_MAX_RETRIES else None,
+            )
+        if attempt < CHUNK_MAX_RETRIES:
             time.sleep(delay)
 
     return True
@@ -389,11 +476,14 @@ def verify_chunks(chunk_paths: list[Path], expected_sizes: list[int]) -> bool:
 
 
 def merge_chunks(chunk_paths: list[Path], final_path: Path) -> None:
-    """Concatenate ordered .partN files into the final destination file."""
-    with final_path.open("wb") as destination_file:
+    """Concatenate chunks to a temporary sibling then atomically publish."""
+    temp_path = Path(f"{final_path}.bunkr-merge-part")
+    with temp_path.open("wb") as destination_file:
         for chunk_path in chunk_paths:
             with chunk_path.open("rb") as chunk_file:
                 shutil.copyfileobj(chunk_file, destination_file)
+    os.link(temp_path, final_path)
+    temp_path.unlink(missing_ok=True)
 
 
 def cleanup(chunk_paths: list[Path], base_path: Path) -> None:
@@ -437,6 +527,10 @@ def save_file_with_chunks(
         # Keep .partN files so the next run can resume incomplete chunks.
         return True
 
-    merge_chunks(chunk_paths, base_path)
+    try:
+        merge_chunks(chunk_paths, base_path)
+    except OSError:
+        # Preserve downloaded chunks for a future retry; never expose partial output.
+        return True
     cleanup(chunk_paths, base_path)
     return False

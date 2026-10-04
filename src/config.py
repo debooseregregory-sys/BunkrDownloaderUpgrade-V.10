@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
 from collections import deque
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -88,7 +88,7 @@ LOG_MANAGER_CONFIG = {
 # Download Settings
 # ============================
 MAX_FILENAME_LEN = 120   # The maximum length for a file name.
-MAX_WORKERS = 3          # The maximum number of threads for concurrent downloads.
+MAX_WORKERS = 1          # The maximum number of concurrent album downloads.
 MAX_RETRIES = 5          # The maximum number of retries for downloading a single media.
 DEFAULT_CONNECTIONS = 4  # Default number of parallel connections for chunked downloads.
 CHUNK_MAX_RETRIES = 4    # Max retry attempts for a single failed chunk.
@@ -291,6 +291,10 @@ _CONFIG_FIELDS: dict[str, tuple[object, object]] = {
     "max_retries": (
         MAX_RETRIES, lambda v: isinstance(v, int) and not isinstance(v, bool),
     ),
+    "max_workers": (
+        MAX_WORKERS,
+        lambda v: isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 5,
+    ),
     "connections": (
         DEFAULT_CONNECTIONS, lambda v: isinstance(v, int) and not isinstance(v, bool),
     ),
@@ -369,6 +373,13 @@ def apply_config_file_defaults(args: Namespace) -> Namespace:
 # ============================
 # Argument Parsing
 # ============================
+def _parse_max_workers(value: str) -> int:
+    workers = int(value)
+    if not 1 <= workers <= 5:
+        raise ArgumentTypeError("max workers must be between 1 and 5")
+    return workers
+
+
 def add_common_arguments(parser: ArgumentParser) -> None:
     """Add arguments shared across parsers."""
     parser.add_argument(
@@ -401,6 +412,12 @@ def add_common_arguments(parser: ArgumentParser) -> None:
         default=None,
         help=f"Maximum number of retries for downloading a single media "
         f"(default: {MAX_RETRIES}).",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=_parse_max_workers,
+        default=None,
+        help=f"Maximum concurrent album downloads (default: {MAX_WORKERS}; range: 1-5).",
     )
     parser.add_argument(
         "--connections",

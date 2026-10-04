@@ -9,6 +9,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from .config import HEADERS, STATUS_PAGE
+from .diagnostics import log_http_503
 
 
 def fetch_status_page() -> BeautifulSoup | None:
@@ -17,7 +18,22 @@ def fetch_status_page() -> BeautifulSoup | None:
         response = requests.get(STATUS_PAGE, headers=HEADERS, timeout=5)
         response.raise_for_status()
 
-    except requests.RequestException:
+    except requests.RequestException as exc:
+        failed_response = getattr(exc, "response", None) or locals().get("response")
+        if failed_response is not None and failed_response.status_code == 503:
+            log_http_503(
+                route="OTHER_GET",
+                url=getattr(failed_response, "url", None) or STATUS_PAGE,
+                filename="status page",
+                retry=1,
+                maximum=1,
+                retry_after=failed_response.headers.get("Retry-After"),
+                wait=0,
+                fresh_signed_url=False,
+                final=True,
+                phase="STATUS_PAGE",
+                reason="status-page request failed",
+            )
         logging.warning("An error occurred while fetching the status page")
         return None
 
